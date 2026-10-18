@@ -1,0 +1,244 @@
+<!doctype html><html lang="ar" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SIM Bridge — iPhone Remote</title>
+<style>
+:root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{background:linear-gradient(135deg,#101a31,#0d1223);color:#f1f5f9;margin:0;padding:24px 15px}
+main{max-width:460px;margin:auto}h1{font-size:30px;letter-spacing:-1px;margin:28px 0 5px}
+p{color:#aebed0;line-height:1.7}.panel{background:#1b2a40;padding:20px;margin:18px 0;border:1px solid #34435c;border-radius:18px}
+label{font-weight:600;font-size:14px;display:block;margin:4px 0 9px}
+input[type=password]{box-sizing:border-box;padding:16px;background:#0b1527;color:white;border:1px solid #53627b;border-radius:12px;width:100%;font-size:18px;direction:ltr}
+button{border:0;border-radius:13px;padding:15px 18px;font-weight:700;font-size:16px;cursor:pointer;margin:5px 3px 5px 0;background:#21c4a5;color:#042c27}
+button.alt{background:#3c506b;color:white}button.danger{background:#fb7185;color:#240609}button:disabled{opacity:.35;cursor:not-allowed}
+.status{display:flex;align-items:center;gap:8px;color:#b9cce0}.dot{height:10px;width:10px;border-radius:50%;background:#64748b}.dot.ok{background:#34d399}
+pre{white-space:pre-wrap;word-break:break-word;color:#b8dbc9;font-size:12px;min-height:32px}
+.small{font-size:12px;color:#91a3ba}#callState{font-size:25px;font-weight:750;color:#f4f7fa;margin:13px 0}
+</style></head><body><main>
+<h1>SIM Bridge <span aria-hidden="true">📞</span></h1><p>شريحتك التركية على Redmi، والصوت على iPhone. اتصال آمن عبر سيرفر Render.</p>
+<section class="panel">
+ <label for="relayKey">مفتاح دخول iPhone إلى Render (BRIDGE_IPHONE_KEY)</label>
+ <input type="password" id="relayKey" autocomplete="off" placeholder="مفتاح Render الخاص بالآيفون">
+ <p class="small">يُدخل من إعدادات Render، وهو مختلف عن رمز الربط داخل Redmi.</p>
+ <label for="token">رمز الربط من تطبيق Redmi (التشفير بين الجهازين)</label><input type="password" id="token" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="الصق رمز الربط هنا">
+ <p><label style="font-weight:normal"><input type="checkbox" id="remember"> احفظ الرمز على هذا الـiPhone (اختياري)</label></p>
+ <button id="connect">اتصل بـRedmi</button><button id="disconnect" class="alt" disabled>فصل الاتصال</button>
+ <div class="status" style="margin-top:12px"><span class="dot" id="dot"></span><span id="connection">غير متصل</span></div>
+</section>
+<section class="panel">
+ <div class="small">حالة الشريحة</div><div id="callState">—</div>
+ <button id="answer" disabled>رد على المكالمة</button>
+ <button id="end" class="danger" disabled>إنهاء المكالمة</button>
+ <button id="mute" class="alt" disabled>كتم الميكروفون</button>
+ <button id="enableAudio" class="alt" disabled>تفعيل صوت الآيفون 🔊</button>
+ <p class="small">Telegram يرسل لك إشعار المكالمة أيضًا. لازم تفتح الصفحة وتتصل قبل الرد. Safari لازم يظل مفتوحًا أثناء الحديث.</p>
+</section>
+<section class="panel"><label>التشخيص</label><pre id="log">جاهز للاتصال</pre></section>
+</main><script>
+'use strict';
+const $=id=>document.getElementById(id);
+const RATE=16000, FRAME=320, MAX_BUFFERED=64000;
+let sock=null, ctx=null, stream=null, micSource=null, processor=null, silence=null;
+let connected=false, authenticated=false, callState='IDLE', muted=false;
+let nextPlay=0, inputCount=0, nextOutputPos=0, lastInput=0, pcmQueue=[];
+let heartbeat=null, playDrops=0, sent=0, received=0, staleDropped=0;
+let clockOffset=null, lastSoundWarning=0;
+let remoteReady=false, relayAuth=false, txKey=null, rxKey=null, pairingInProgress=false, outSeq=0n, inSeq=-1n;
+let sendChain=Promise.resolve(), receiveChain=Promise.resolve();
+const encoder=new TextEncoder(), decoder=new TextDecoder();
+const INFO_I2G=encoder.encode('SIMBridge-Render-v1 iphone-to-gateway');
+const INFO_G2I=encoder.encode('SIMBridge-Render-v1 gateway-to-iphone');
+function b64url(bytes){let s='';for(const b of bytes)s+=String.fromCharCode(b);return btoa(s).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');}
+function fromB64url(str){const txt=atob(str.replaceAll('-','+').replaceAll('_','/')+'==='.slice((str.length+3)%4));return Uint8Array.from(txt,c=>c.charCodeAt(0));}
+function nonce(prefix, seq){const b=new Uint8Array(12),v=new DataView(b.buffer);v.setUint32(0,prefix);v.setBigUint64(4,seq);return b;}
+async function startEncryptedPair(){
+ if(!relayAuth||!remoteReady||txKey||pairingInProgress)return;
+ pairingInProgress=true;
+ try {
+ const secret=fromB64url($('token').value.trim());
+ if(secret.length<24)throw new Error('رمز Redmi غير صالح');
+ const salt=crypto.getRandomValues(new Uint8Array(16));
+ const master=await crypto.subtle.importKey('raw',secret,'HKDF',false,['deriveKey']);
+ const derive=info=>crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt,info},master,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+ txKey=await derive(INFO_I2G);rxKey=await derive(INFO_G2I);outSeq=0n;inSeq=-1n;
+ sock.send(JSON.stringify({type:'hello',salt:b64url(salt)}));
+ // Hello must reach gateway before the first encrypted application message.
+ sendApp(1,encoder.encode('AUTH '+$('token').value.trim()));
+ log('تبادل مفاتيح مشفّر بين iPhone وRedmi...');
+ } finally { pairingInProgress=false; }
+}
+function sendApp(opcode,data){
+ if(!sock||sock.readyState!==1||!txKey)return;
+ const currentSocket=sock;
+ if(opcode===2 && (currentSocket.bufferedAmount>MAX_BUFFERED || pendingAudio>6))return;
+ if(opcode===2)pendingAudio++;
+ sendChain=sendChain.then(async()=>{
+  if(currentSocket!==sock||currentSocket.readyState!==1||!txKey)return;
+  const seq=outSeq++,hdr=new Uint8Array(12),view=new DataView(hdr.buffer);
+  hdr.set([83,66,82,49]);view.setBigUint64(4,seq);
+  const plain=new Uint8Array(data.length+1);plain[0]=opcode;plain.set(data,1);
+  const ciphertext=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce(0x49324741,seq),additionalData:hdr},txKey,plain));
+  if(currentSocket!==sock||currentSocket.readyState!==1)return;
+  const pkt=new Uint8Array(hdr.length+ciphertext.length);pkt.set(hdr);pkt.set(ciphertext,12);
+  if(opcode!==2||currentSocket.bufferedAmount<MAX_BUFFERED)currentSocket.send(pkt);
+ }).catch(e=>log('فشل إرسال صوت مشفّر: '+e.message)).finally(()=>{if(opcode===2)pendingAudio--;});
+}
+let pendingAudio=0;
+function sendTextCommand(value){sendApp(1,encoder.encode(value));}
+async function decryptPacket(data){
+ if(!rxKey)return;
+ const packet=new Uint8Array(data);
+ if(packet.length<29||packet[0]!==83||packet[1]!==66||packet[2]!==82||packet[3]!==49)throw new Error('رسالة غير مشفرة');
+ const seq=new DataView(packet.buffer,packet.byteOffset,packet.byteLength).getBigUint64(4);
+ if(seq<=inSeq)throw new Error('Replay/out-of-order');
+ const decrypted=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce(0x47324950,seq),additionalData:packet.slice(0,12)},rxKey,packet.slice(12)));
+ inSeq=seq;
+ if(decrypted[0]===1)processAppText(decoder.decode(decrypted.slice(1)));
+ else if(decrypted[0]===2)playback(decrypted.slice(1).buffer);
+}
+function processAppText(m){
+ if(m==='AUTH_OK'){authenticated=true;renderConnection();log('اتصال محمي بالـRedmi نجح');}
+ else if(m.startsWith('CLOCK ')){const ms=Number(m.slice(6));if(Number.isFinite(ms))clockOffset=Date.now()-ms;}
+ else if(m.startsWith('STATE ')){state(m.substring(6));renderConnection();}
+ else if(m.startsWith('METRICS ')){log(m);}
+ else if(m.startsWith('ERROR')){log(m);}
+ else if(m.startsWith('RESULT')){log(m);}
+}
+$('token').value=localStorage.getItem('simbridge_token')||'';
+$('remember').checked=Boolean(localStorage.getItem('simbridge_token'));
+function log(s){$('log').textContent=(new Date().toLocaleTimeString()+' '+s+'\n'+$('log').textContent).slice(0,750);}
+function state(s){callState=s;
+ $('callState').textContent=({IDLE:'لا توجد مكالمة',RINGING:'مكالمة واردة',ACTIVE:'مكالمة جارية'})[s]||s;
+ $('answer').disabled=!(authenticated&&s==='RINGING');$('end').disabled=!(authenticated&&s!=='IDLE');
+ $('mute').disabled=!(authenticated&&s==='ACTIVE');
+ $('enableAudio').disabled=!authenticated;
+ if(s!=='ACTIVE'){nextPlay=0;pcmQueue=[];inputCount=0;nextOutputPos=0;lastInput=0;}
+}
+function renderConnection(){
+ $('dot').classList.toggle('ok',authenticated);
+ $('connection').textContent=authenticated?'متصل بالـRedmi':connected?'جارٍ التحقق...':'غير متصل';
+ $('connect').disabled=connected;$('disconnect').disabled=!connected;
+ state(callState);
+}
+function queueSample(v){pcmQueue.push(Math.max(-32768,Math.min(32767,Math.round(v*32767))));
+ if(pcmQueue.length===FRAME){
+  if(authenticated&&callState==='ACTIVE'&&sock&&sock.readyState===1&&sock.bufferedAmount<MAX_BUFFERED){
+   const frame=new Int16Array(FRAME);
+   for(let k=0;k<FRAME;k++)frame[k]=muted?0:pcmQueue[k];
+   sendApp(2,new Uint8Array(frame.buffer));sent++;
+  }
+  pcmQueue=[];
+ }
+}
+function feedMic(data){
+ if(!authenticated||callState!=='ACTIVE')return;
+ const start=inputCount,end=start+data.length,step=ctx.sampleRate/RATE;
+ while(nextOutputPos<end-1){
+  let local=nextOutputPos-start;
+  let a,b,alpha;
+  if(local<0){a=lastInput;b=data[0];alpha=local+1;}
+  else{let i=Math.floor(local);a=data[i];b=data[i+1];alpha=local-i;}
+  queueSample(a+(b-a)*alpha);nextOutputPos+=step;
+ }
+ lastInput=data[data.length-1];inputCount=end;
+}
+function playback(buffer){
+ if(!ctx||!authenticated||callState!=='ACTIVE')return;
+ // v0.5.1 server audio packet: SB51, little-endian capture time, PCM16LE.
+ const view=new DataView(buffer);
+ if(view.byteLength<14||view.getUint8(0)!==83||view.getUint8(1)!==66||view.getUint8(2)!==53||view.getUint8(3)!==49)return;
+ const captureMs=view.getUint32(4,true)+4294967296*view.getUint32(8,true);
+ if(clockOffset!==null){
+  const ageMs=Date.now()-captureMs-clockOffset;
+  if(ageMs>1200){staleDropped++;return;}
+ }
+ // An iOS-suspended audio context must not collect audio to replay later.
+ if(ctx.state!=='running'){
+  const now=Date.now();
+  if(now-lastSoundWarning>4000){log('صوت Safari متوقف: اضغط تفعيل صوت الآيفون');lastSoundWarning=now;}
+  staleDropped++;return;
+ }
+ const pcm=new Int16Array(buffer.slice(12));
+ if(!pcm.length)return;
+ const b=ctx.createBuffer(1,pcm.length,RATE), channel=b.getChannelData(0);
+ for(let i=0;i<pcm.length;i++)channel[i]=pcm[i]/32768;
+ const source=ctx.createBufferSource();source.buffer=b;source.connect(ctx.destination);
+ const now=ctx.currentTime;
+ if(nextPlay<now+.025)nextPlay=now+.095;
+ if(nextPlay>now+.35){nextPlay=now+.12;playDrops++;}
+ source.start(nextPlay);nextPlay+=b.duration;received++;
+}
+async function cleanup(){
+ authenticated=false;connected=false;muted=false;
+ if(heartbeat){clearInterval(heartbeat);heartbeat=null;}
+ if(processor){processor.onaudioprocess=null;processor.disconnect();processor=null;}
+ if(micSource){micSource.disconnect();micSource=null;}
+ if(silence){silence.disconnect();silence=null;}
+ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+ if(sock){const old=sock;sock=null;old.onclose=null;old.close();}
+ remoteReady=false;relayAuth=false;txKey=null;rxKey=null;pairingInProgress=false;outSeq=0n;inSeq=-1n;sendChain=Promise.resolve();receiveChain=Promise.resolve();pendingAudio=0;
+ if(ctx){const old=ctx;ctx=null;await old.close();}
+ nextPlay=0;inputCount=0;nextOutputPos=0;lastInput=0;pcmQueue=[];clockOffset=null;
+ callState='IDLE';renderConnection();$('mute').textContent='كتم الميكروفون';
+}
+$('disconnect').onclick=()=>cleanup();
+$('connect').onclick=async()=>{
+ if(connected)return;
+ const token=$('token').value.trim();if(!token){log('أدخل رمز الربط أولًا');return;}
+ const relayKey=$('relayKey').value.trim();if(!relayKey){log('أدخل مفتاح Render الخاص بالآيفون');return;}
+ if($('remember').checked)localStorage.setItem('simbridge_token',token);else localStorage.removeItem('simbridge_token');
+ try{
+  // Acquire the mic from a direct user gesture; iOS will not grant it from a background callback.
+  ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();
+  stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+  micSource=ctx.createMediaStreamSource(stream);
+  processor=ctx.createScriptProcessor(2048,1,1);
+  silence=ctx.createGain();silence.gain.value=0;silence.connect(ctx.destination);
+  micSource.connect(processor);processor.connect(silence);
+  processor.onaudioprocess=e=>feedMic(e.inputBuffer.getChannelData(0));
+  sock=new WebSocket('wss://'+location.host+'/ws/iphone');sock.binaryType='arraybuffer';
+  connected=true;renderConnection();
+  sock.onopen=()=>sock.send(JSON.stringify({type:'auth',token:relayKey}));
+  sock.onmessage=e=>{
+   if(typeof e.data==='string'){
+    try{
+     const notice=JSON.parse(e.data);
+     if(notice.type==='ready'){relayAuth=true;log('تم تسجيل الدخول إلى Render');}
+     if(notice.type==='peer'){
+      remoteReady=Boolean(notice.online);
+      if(!remoteReady){txKey=null;rxKey=null;pairingInProgress=false;relayAuth=true;authenticated=false;renderConnection();log('Redmi غير متصل بالسيرفر');return;}
+      startEncryptedPair().catch(err=>log('فشل تهيئة تشفير الصوت: '+err.message));
+     }
+    }catch(err){log('رسالة وسيط غير مفهومة: '+err.message);}
+    return;
+   }
+   receiveChain=receiveChain.then(()=>decryptPacket(e.data)).catch(err=>{
+     log('فشل فك تشفير/تحقق الرسالة: '+err.message);
+     if(sock&&sock.readyState===1)sock.close();
+   });
+  };
+  sock.onerror=()=>log('فشل اتصال Render: تحقق من عنوان الخدمة وصحة المفاتيح');
+  sock.onclose=()=>{log('انقطع الاتصال بالـRedmi');cleanup();};
+  heartbeat=setInterval(()=>{if(sock&&sock.readyState===1){sendTextCommand('PING');sendTextCommand('STATS');log('iPhone audio='+ (ctx?ctx.state:'none')+' received='+received+' staleDropped='+staleDropped+' playResets='+playDrops);}},15000);
+ }catch(e){log('خطأ: '+e.message);await cleanup();}
+};
+async function unlockSound(){
+ if(!ctx)return;
+ try {await ctx.resume();log('حالة صوت Safari: '+ctx.state);}
+ catch(e){log('تعذر تفعيل الصوت: '+e.message);}
+}
+$('enableAudio').onclick=()=>unlockSound();
+$('answer').onclick=()=>{
+ // Resume directly from a user gesture: Safari can suspend AudioContext while waiting for a call.
+ if(ctx)ctx.resume().catch(e=>log('صوت Safari: '+e.message));
+ if(authenticated&&callState==='RINGING')sendTextCommand('ANSWER');
+};
+document.addEventListener('visibilitychange',()=>{
+ if(!document.hidden&&ctx&&ctx.state!=='running'){
+  // May require tapping the explicit audio button on iOS.
+  ctx.resume().catch(()=>{});
+ }
+});
+$('end').onclick=()=>{if(authenticated&&callState!=='IDLE')sendTextCommand('END');};
+$('mute').onclick=()=>{muted=!muted;$('mute').textContent=muted?'إلغاء الكتم':'كتم الميكروفون';};
+renderConnection();
+</script></body></html>

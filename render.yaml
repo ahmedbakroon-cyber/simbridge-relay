@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: simbridge-relay-prototype
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python relay.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: BRIDGE_GATEWAY_KEY
+        generateValue: true
+      - key: BRIDGE_IPHONE_KEY
+        generateValue: true
